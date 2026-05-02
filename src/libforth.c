@@ -7,6 +7,30 @@
 
 void populate_core_words(Program_State *ps);
 void populate_tool_words(Program_State *ps);
+
+static void smorth_lib_die(const char *message)
+{
+    fprintf(stderr, "%s\n", message);
+    exit(1);
+}
+
+static size_t cf_stack_capacity(Program_State *ps)
+{
+    return sizeof(ps->cf_stack)/sizeof(ps->cf_stack[0]);
+}
+
+static void push_cf(Program_State *ps, const char *kind, size_t handle)
+{
+    if(ps->cfi>=cf_stack_capacity(ps)) smorth_lib_die("control-flow stack overflow");
+    ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind=(char *)kind, .handle=handle};
+}
+
+static Control_Flow_Stack_Item pop_cf(Program_State *ps)
+{
+    if(ps->cfi==0) smorth_lib_die("control-flow stack underflow");
+    return ps->cf_stack[--ps->cfi];
+}
+
 void populate_builtin_words(Program_State *ps)
 {
     populate_core_words(ps);
@@ -16,7 +40,11 @@ void populate_builtin_words(Program_State *ps)
 void load_library(const char *lib_path, Program_State *ps)
 {
     String_Builder lib_code = {0};
-    read_entire_file(lib_path, &lib_code);
+    if(!read_entire_file(lib_path, &lib_code))
+    {
+        fprintf(stderr, "failed to load library: %s\n", lib_path);
+        exit(1);
+    }
     for(size_t i=0;i<lib_code.count;i++) if(isspace(lib_code.items[i])) lib_code.items[i]=' ';
     sb_append_null(&lib_code);
 
@@ -35,15 +63,18 @@ void dot_impl(int64_t num)
 
 void colon_impl(Program_State *ps)
 {
+    if(ps->compiling) smorth_lib_die("nested word declarations are not supported");
     Token token = next_token(&ps->ib);
+    if(token.raw.count==0 || token.kind!=FWORD) smorth_lib_die("expected word name after :");
     ps->word_name=token.raw.data;
-    ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind = "colon-sys", .handle=get_jmp_marker(&ps->word_source)};
+    push_cf(ps, "colon-sys", get_jmp_marker(&ps->word_source));
     ps->compiling=true;
 }
 
 void semicolon_impl(Program_State *ps)
 {
-    if(strcmp(ps->cf_stack[--ps->cfi].kind, "colon-sys")!=0) UNREACHABLE("invalid address stack");
+    if(!ps->compiling) smorth_lib_die("; outside word declaration");
+    if(strcmp(pop_cf(ps).kind, "colon-sys")!=0) smorth_lib_die("invalid control-flow stack for ;");
     sb_insert_ret(&ps->word_source);
     if(ps->immediate) add_word_imm(&ps->word_table, ps->word_name, ps->word_source);
     else add_word(&ps->word_table, ps->word_name, ps->word_source);
@@ -56,40 +87,40 @@ void semicolon_impl(Program_State *ps)
 
 void begin_impl(Program_State *ps)
 {
-    ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind="dist", .handle=get_jmp_marker(&ps->word_source)};
+    push_cf(ps, "dist", get_jmp_marker(&ps->word_source));
 }
 
 void while_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),0), get_register(0));
         sb_insert_cmpimm(&ps->word_source, get_register(0), 0);
-        ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind="orig", .handle=sb_start_jcc(&ps->word_source, EQ)};
-        ps->cf_stack[ps->cfi++] = item;
+        push_cf(ps, "orig", sb_start_jcc(&ps->word_source, EQ));
+        push_cf(ps, item.kind, item.handle);
     }
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for while");
 }
 
 void repeat_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
         sb_insert_jmp(&ps->word_source, item.handle);
-        item = ps->cf_stack[--ps->cfi];
+        item = pop_cf(ps);
         if (strcmp(item.kind, "orig")==0) sb_end_jmp(&ps->word_source, item.handle);
-        else UNREACHABLE("invalid address stack");
+        else smorth_lib_die("invalid control-flow stack for repeat");
     }
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for repeat");
 }
 
 void until_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
@@ -98,7 +129,7 @@ void until_impl(Program_State *ps)
         sb_insert_cmpimm(&ps->word_source, get_register(0), 0);
         sb_insert_jcc(&ps->word_source, item.handle, EQ);
     }
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for until");
 }
 
 void do_init_impl(Program_State *ps)
@@ -111,7 +142,7 @@ void do_init_impl(Program_State *ps)
     sb_insert_current_address(&ps->word_source, get_register(0));
     size_t diff = get_jmp_marker(&ps->word_source);
     sb_insert_addimm(&ps->word_source, get_register(0), 0);
-    ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind="do-sys", .handle=ps->word_source.count};
+    push_cf(ps, "do-sys", ps->word_source.count);
     sb_insert_addimm(&ps->word_source, get_register(0), get_jmp_marker(&ps->word_source)-diff);
     sb_insert_push(&ps->word_source, get_register(0));
 
@@ -123,7 +154,7 @@ void do_init_impl(Program_State *ps)
 
 void plus_loop_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
@@ -139,11 +170,11 @@ void plus_loop_impl(Program_State *ps)
         sb_insert_pop(&ps->word_source, get_register(0));
         sb_insert_pop(&ps->word_source, get_register(0));
     }
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for +loop");
 
-     item = ps->cf_stack[--ps->cfi];
+     item = pop_cf(ps);
      if(strcmp(item.kind, "do-sys")==0) sb_end_jmp(&ps->word_source, item.handle);
-     else UNREACHABLE("invalid address stack");
+     else smorth_lib_die("invalid control-flow stack for +loop");
 }
 
 void if_impl(Program_State *ps)
@@ -152,25 +183,25 @@ void if_impl(Program_State *ps)
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1), 0), get_register(0));
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0), 0), get_register(0));
     sb_insert_cmpimm(&ps->word_source, get_register(0), 0);
-    ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind="orig", .handle=sb_start_jcc(&ps->word_source, EQ)};
+    push_cf(ps, "orig", sb_start_jcc(&ps->word_source, EQ));
 }
 
 void else_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if(strcmp(item.kind, "orig")==0)
     {
-        ps->cf_stack[ps->cfi++] = (Control_Flow_Stack_Item){.kind="orig", .handle=sb_start_jmp(&ps->word_source)};
+        push_cf(ps, "orig", sb_start_jmp(&ps->word_source));
         sb_end_jmp(&ps->word_source, item.handle);
     }
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for else");
 }
 
 void then_impl(Program_State *ps)
 {
-    Control_Flow_Stack_Item item = ps->cf_stack[--ps->cfi];
+    Control_Flow_Stack_Item item = pop_cf(ps);
     if(strcmp(item.kind, "orig")==0) sb_end_jmp(&ps->word_source, item.handle);
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("invalid control-flow stack for then");
 }
 
 void parse_impl(Program_State *ps)
@@ -178,7 +209,7 @@ void parse_impl(Program_State *ps)
     char delim = *(--ps->sp);
 
     ps->ib = sv_trim_left(ps->ib);
-    if(ps->ib.count==0) exit(1);
+    if(ps->ib.count==0) smorth_lib_die("parse reached end of input");
 
     String_Builder ccc = {0};
     while (ps->ib.count>0 && ps->ib.data[0]!=delim) sb_append(&ccc, *sv_chop_left(&ps->ib, 1).data);
@@ -246,9 +277,9 @@ void literal_impl(Program_State *ps)
 void recurse_impl(Program_State *ps)
 {
     Control_Flow_Stack_Item *item=NULL;
-    for(ptrdiff_t i=ps->cfi-1; i>=0;--i) if(strcmp("colon-sys", ps->cf_stack[i].kind)==0) {item=&ps->cf_stack[i]; break;}
+    for(size_t i=ps->cfi; i>0;--i) if(strcmp("colon-sys", ps->cf_stack[i-1].kind)==0) {item=&ps->cf_stack[i-1]; break;}
     if(item) sb_insert_rel_call(&ps->word_source, item->handle);
-    else UNREACHABLE("invalid address stack");
+    else smorth_lib_die("recurse outside word declaration");
 }
 
 void type_impl(Program_State *ps)
