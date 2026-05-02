@@ -1,6 +1,7 @@
 #define NOB_IMPLEMENTATION
 #include <nob.h>
 #undef NOB_IMPLEMENTATION
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -12,6 +13,21 @@
 int main(int argc, char **argv)
 {   
     Program_State program_state = {0};
+    program_state.stack_base = program_state.stack;
+    program_state.stack_limit = program_state.stack + SMORTH_STACK_CAPACITY;
+    const char *stack_limit_cells = getenv("SMORTH_STACK_LIMIT_CELLS");
+    if(stack_limit_cells!=NULL && stack_limit_cells[0]!='\0')
+    {
+        errno = 0;
+        char *end = NULL;
+        long limit = strtol(stack_limit_cells, &end, 10);
+        if(errno!=0 || end==stack_limit_cells || *end!='\0' || limit<=0 || limit>SMORTH_STACK_CAPACITY)
+        {
+            fprintf(stderr, "invalid SMORTH_STACK_LIMIT_CELLS: %s\n", stack_limit_cells);
+            return 1;
+        }
+        program_state.stack_limit = program_state.stack + limit;
+    }
     program_state.sp = program_state.stack;
     program_state.dp = program_state.data;
     
