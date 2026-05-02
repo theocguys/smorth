@@ -76,9 +76,9 @@ void semicolon_impl(Program_State *ps)
     if(!ps->compiling) smorth_lib_die("; outside word declaration");
     if(strcmp(pop_cf(ps).kind, "colon-sys")!=0) smorth_lib_die("invalid control-flow stack for ;");
     sb_insert_ret(&ps->word_source);
-    if(ps->immediate) add_word_imm(&ps->word_table, ps->word_name, ps->word_source);
-    else add_word(&ps->word_table, ps->word_name, ps->word_source);
-    if (ps->word_name==NULL) *(ps->sp++) = (int64_t)&ps->word_table.items[ps->word_table.count-1];
+    if(ps->immediate) add_word_imm(ps, ps->word_name, ps->word_source);
+    else add_word(ps, ps->word_name, ps->word_source);
+    if (ps->word_name==NULL) smorth_stack_push(ps, (int64_t)&ps->word_table.items[ps->word_table.count-1], ";");
     ps->word_name=NULL;
     ps->word_source.count=0;
     ps->compiling=false;
@@ -95,6 +95,7 @@ void while_impl(Program_State *ps)
     Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
+        sb_insert_stack_effect_guard(&ps->word_source, ps, "while", 1, 0);
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),0), get_register(0));
@@ -123,6 +124,7 @@ void until_impl(Program_State *ps)
     Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
+        sb_insert_stack_effect_guard(&ps->word_source, ps, "until", 1, 0);
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),0), get_register(0));
@@ -134,6 +136,7 @@ void until_impl(Program_State *ps)
 
 void do_init_impl(Program_State *ps)
 {
+    sb_insert_stack_effect_guard(&ps->word_source, ps, "do", 2, 0);
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),-8), get_register(5));
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),-16), get_register(6));
@@ -157,6 +160,7 @@ void plus_loop_impl(Program_State *ps)
     Control_Flow_Stack_Item item = pop_cf(ps);
     if (strcmp(item.kind, "dist")==0)
     {
+        sb_insert_stack_effect_guard(&ps->word_source, ps, "+loop", 1, 0);
         sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1),0), 0x8);
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0),0), get_register(5));
@@ -179,6 +183,7 @@ void plus_loop_impl(Program_State *ps)
 
 void if_impl(Program_State *ps)
 {
+    sb_insert_stack_effect_guard(&ps->word_source, ps, "if", 1, 0);
     sb_insert_subimm(&ps->word_source, reg_make_ptr(get_register(1), 0), 8);
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1), 0), get_register(0));
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(0), 0), get_register(0));
@@ -206,7 +211,7 @@ void then_impl(Program_State *ps)
 
 void parse_impl(Program_State *ps)
 {
-    char delim = *(--ps->sp);
+    char delim = (char)smorth_stack_pop(ps, "parse");
 
     ps->ib = sv_trim_left(ps->ib);
     if(ps->ib.count==0) smorth_lib_die("parse reached end of input");
@@ -219,26 +224,26 @@ void parse_impl(Program_State *ps)
         sv_chop_left(&ps->ib, 1);
     }
     
-    *(ps->sp++) = (uint64_t)ccc.items;
-    *(ps->sp++) = ccc.count;
+    smorth_stack_push(ps, (uint64_t)ccc.items, "parse");
+    smorth_stack_push(ps, ccc.count, "parse");
 
     return;
 }
 
 void find_impl(Program_State *ps)
 {
-    const char *name = *(const char **)(--ps->sp);
+    const char *name = (const char *)smorth_stack_pop(ps, "find");
 
     Execution_Token *word = get_word(&ps->word_table, name);
     if(word!=NULL)
     {
-        *(ps->sp++) = (uint64_t)word;
-        *(ps->sp++) = (word->imm) ? 1:-1;
+        smorth_stack_push(ps, (uint64_t)word, "find");
+        smorth_stack_push(ps, (word->imm) ? 1:-1, "find");
     }
     else
     {
-        *(ps->sp++) = (uint64_t)name;
-        *(ps->sp++) = 0;
+        smorth_stack_push(ps, (uint64_t)name, "find");
+        smorth_stack_push(ps, 0, "find");
     }
 
     return;
@@ -246,28 +251,31 @@ void find_impl(Program_State *ps)
 
 void compile_comma_impl(Program_State *ps)
 {
-    Execution_Token *word = *(Execution_Token**)(--ps->sp);
+    Execution_Token *word = (Execution_Token *)smorth_stack_pop(ps, "compile,");
+    if(word==NULL) smorth_lib_die("compile, requires a word");
     sb_insert_call(&ps->word_source, word->codeptr);
 }
 
 void aligned_impl(Program_State *ps) 
 {
-    int64_t *addr = *(int64_t**)(--ps->sp);
+    int64_t *addr = (int64_t *)smorth_stack_pop(ps, "aligned");
     uint64_t phase = (uint64_t)ps->dp%8;
     if(phase!=0) addr = (int64_t *)((char *)addr+(8-phase));
-    *(ps->sp++) = (int64_t)addr;
+    smorth_stack_push(ps, (int64_t)addr, "aligned");
 }
 
 void execute_impl(Program_State *ps)
 {
-    Execution_Token *word = (Execution_Token*)(--ps->sp);
+    Execution_Token *word = (Execution_Token *)smorth_stack_pop(ps, "execute");
+    if(word==NULL) smorth_lib_die("execute requires a word");
     call_word(word->codeptr, ps);
 }
 
 void literal_impl(Program_State *ps)
 {
-    uint64_t x = *(--ps->sp);
+    uint64_t x = smorth_stack_pop(ps, "literal");
 
+    sb_insert_stack_effect_guard(&ps->word_source, ps, "literal", 0, 1);
     sb_insert_mov(&ps->word_source, reg_make_ptr(get_register(1),0), get_register(0));
     sb_insert_movabs(&ps->word_source, get_register(5), (void *)x);
     sb_insert_mov(&ps->word_source, get_register(5), reg_make_ptr(get_register(0),0));
@@ -284,8 +292,8 @@ void recurse_impl(Program_State *ps)
 
 void type_impl(Program_State *ps)
 {
-    uint64_t len = *(--ps->sp);
-    char *buf = *(char **)(--ps->sp);
+    uint64_t len = smorth_stack_pop(ps, "type");
+    char *buf = (char *)smorth_stack_pop(ps, "type");
 
     if(len>0)
     {
@@ -307,7 +315,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, reg_make_ptr(get_register(0),0), get_register(6));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(5),0));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "!", src);
+    add_word_effect(ps, "!", src, 2, 0);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -318,7 +326,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(6),-8));
         sb_insert_subimm(&src, reg_make_ptr(get_register(1),0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, ",", src);
+    add_word_effect(ps, ",", src, 1, 0);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -326,7 +334,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, reg_make_ptr(get_register(5),0), get_register(5));
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "@", src);
+    add_word_effect(ps, "@", src, 1, 1);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -336,7 +344,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_add(&src, get_register(5), get_register(6));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "+", src);
+    add_word_effect(ps, "+", src, 2, 1);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x10);
@@ -345,7 +353,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, reg_make_ptr(get_register(0),8), get_register(6));
         sb_insert_add(&src, get_register(5), reg_make_ptr(get_register(6),0));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "+!", src);
+    add_word_effect(ps, "+!", src, 2, 0);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -355,7 +363,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_sub(&src, get_register(5), get_register(6));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "-", src);
+    add_word_effect(ps, "-", src, 2, 1);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -365,7 +373,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_imul(&src, get_register(5), get_register(6));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "*", src);
+    add_word_effect(ps, "*", src, 2, 1);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -375,7 +383,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_idiv(&src, get_register(5), get_register(6));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "/", src);
+    add_word_effect(ps, "/", src, 2, 1);
     
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -383,7 +391,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "dup", src);
+    add_word_effect(ps, "dup", src, 1, 2);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -393,17 +401,17 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),8));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x10);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "2dup", src);
+    add_word_effect(ps, "2dup", src, 2, 4);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "drop", src);
+    add_word_effect(ps, "drop", src, 1, 0);
 
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x10);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "2drop", src);
+    add_word_effect(ps, "2drop", src, 2, 0);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -411,7 +419,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "over", src);
+    add_word_effect(ps, "over", src, 2, 3);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -421,7 +429,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),8));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x10);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "2over", src);
+    add_word_effect(ps, "2over", src, 4, 6);
         
     src.count = 0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -429,7 +437,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, reg_make_ptr(get_register(0),0), get_register(5));
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "nip", src);
+    add_word_effect(ps, "nip", src, 2, 1);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -438,7 +446,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-16));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "swap", src);
+    add_word_effect(ps, "swap", src, 2, 2);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -451,7 +459,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-0x20));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-0x10));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "2swap", src);
+    add_word_effect(ps, "2swap", src, 4, 4);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -462,7 +470,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-16));
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-24));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "rot", src);
+    add_word_effect(ps, "rot", src, 3, 3);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -473,7 +481,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "tuck", src);
+    add_word_effect(ps, "tuck", src, 2, 3);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(5));
@@ -485,7 +493,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "depth", src);
+    add_word_effect(ps, "depth", src, 0, 1);
 
     src.count = 0;
     {
@@ -497,7 +505,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, ".", src);
+    add_word_effect(ps, ".", src, 1, 0);
 
     src.count = 0;
     {
@@ -507,7 +515,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, ":", src);
+    add_word(ps, ":", src);
 
     src.count = 0;
     {
@@ -517,7 +525,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, ";", src);
+    add_word_imm(ps, ";", src);
 
     src.count = 0;
     {
@@ -527,7 +535,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "begin", src);
+    add_word_imm(ps, "begin", src);
 
     src.count = 0;
     {
@@ -537,7 +545,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "while", src);
+    add_word_imm(ps, "while", src);
 
     src.count = 0;
     {
@@ -547,7 +555,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "repeat", src);
+    add_word_imm(ps, "repeat", src);
 
     src.count = 0;
     {
@@ -557,7 +565,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "until", src);
+    add_word_imm(ps, "until", src);
 
     src.count = 0;
     {
@@ -567,7 +575,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "(do)", src);
+    add_word_imm(ps, "(do)", src);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -575,7 +583,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "i", src);
+    add_word_effect(ps, "i", src, 0, 1);
 
     src.count = 0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -583,7 +591,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "j", src);
+    add_word_effect(ps, "j", src, 0, 1);
 
     src.count = 0;
         sb_insert_pop(&src, get_register(0));
@@ -591,7 +599,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_pop(&src, get_register(0));
         sb_insert_pop(&src, get_register(0));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "leave", src);
+    add_word(ps, "leave", src);
 
     src.count = 0;
         sb_insert_pop(&src, get_register(5));
@@ -601,12 +609,12 @@ void populate_core_words(Program_State *ps)
         sb_insert_pop(&src, get_register(0));
         sb_insert_push(&src, get_register(5));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "unloop", src);
+    add_word(ps, "unloop", src);
 
     src.count = 0;
         sb_insert_pop(&src, get_register(0));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "exit", src);
+    add_word(ps, "exit", src);
 
     src.count = 0;
     {
@@ -616,7 +624,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "+loop", src);
+    add_word_imm(ps, "+loop", src);
 
     src.count = 0;
     {
@@ -626,7 +634,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "if", src);
+    add_word_imm(ps, "if", src);
 
     src.count = 0;
     {
@@ -636,7 +644,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "else", src);
+    add_word_imm(ps, "else", src);
 
     src.count = 0;
     {
@@ -646,7 +654,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "then", src);
+    add_word_imm(ps, "then", src);
 
     src.count = 0;
     {
@@ -656,7 +664,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "parse", src);
+    add_word_effect(ps, "parse", src, 1, 2);
 
     src.count = 0;
     {
@@ -666,7 +674,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "find", src);
+    add_word_effect(ps, "find", src, 1, 2);
 
     src.count = 0;
     {
@@ -676,7 +684,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "compile,", src);
+    add_word_effect(ps, "compile,", src, 1, 0);
 
     src.count = 0;
         sb_insert_pop(&src, get_register(5));
@@ -685,7 +693,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_push(&src, reg_make_ptr(get_register(0),0));
         sb_insert_push(&src, get_register(5));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, ">r", src);
+    add_word_effect(ps, ">r", src, 1, 0);
 
     src.count = 0;
         sb_insert_pop(&src, get_register(5));
@@ -694,7 +702,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_push(&src, get_register(5));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "r>", src);
+    add_word_effect(ps, "r>", src, 0, 1);
     
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -702,7 +710,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flagimm(&src, get_register(5), 0, LT);
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "0<", src);
+    add_word_effect(ps, "0<", src, 1, 1);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -710,7 +718,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flagimm(&src, get_register(5), 0, EQ);
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "0=", src);
+    add_word_effect(ps, "0=", src, 1, 1);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -718,7 +726,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flagimm(&src, get_register(5), 0, NE);
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "0<>", src);
+    add_word_effect(ps, "0<>", src, 1, 1);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -726,7 +734,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flagimm(&src, get_register(5), 0, GT);
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "0>", src);
+    add_word_effect(ps, "0>", src, 1, 1);
 
     src.count=0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -736,7 +744,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flag(&src, get_register(5), get_register(6), LT);
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "<", src);
+    add_word_effect(ps, "<", src, 2, 1);
 
     src.count=0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -746,7 +754,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flag(&src, get_register(5), get_register(6), EQ);
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "=", src);
+    add_word_effect(ps, "=", src, 2, 1);
 
     src.count=0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -756,7 +764,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flag(&src, get_register(5), get_register(6), NE);
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "<>", src);
+    add_word_effect(ps, "<>", src, 2, 1);
 
     src.count=0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -766,19 +774,19 @@ void populate_core_words(Program_State *ps)
         sb_insert_get_flag(&src, get_register(5), get_register(6), GT);
         sb_insert_mov(&src, get_register(6), reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, ">", src);
+    add_word_effect(ps, ">", src, 2, 1);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_inc(&src, reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "1+", src);
+    add_word_effect(ps, "1+", src, 1, 1);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
         sb_insert_dec(&src, reg_make_ptr(get_register(0),-8));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "1-", src);
+    add_word_effect(ps, "1-", src, 1, 1);
 
     src.count = 0;
     {
@@ -788,7 +796,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "aligned", src);
+    add_word_effect(ps, "aligned", src, 1, 1);
 
     src.count=0;
         sb_insert_subimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
@@ -797,7 +805,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_movabs(&src, get_register(6), &ps->dp);
         sb_insert_add(&src, get_register(5), reg_make_ptr(get_register(6),0));
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "allot", src);
+    add_word_effect(ps, "allot", src, 1, 0);
 
     src.count = 0;
     {
@@ -807,7 +815,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "execute", src);
+    add_word_effect(ps, "execute", src, 1, 0);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -816,7 +824,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "here", src);
+    add_word_effect(ps, "here", src, 0, 1);
 
     src.count=0;
     {
@@ -826,7 +834,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "literal", src);
+    add_word_imm_effect(ps, "literal", src, 1, 0);
 
     src.count=0;
         sb_insert_mov(&src, reg_make_ptr(get_register(1),0), get_register(0));
@@ -834,7 +842,7 @@ void populate_core_words(Program_State *ps)
         sb_insert_mov(&src, get_register(5), reg_make_ptr(get_register(0),0));
         sb_insert_addimm(&src, reg_make_ptr(get_register(1), 0), 0x8);
         sb_insert_ret(&src);
-    add_word(&ps->word_table, "state", src);
+    add_word_effect(ps, "state", src, 0, 1);
 
     src.count=0;
     {
@@ -844,7 +852,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word_imm(&ps->word_table, "recurse", src);
+    add_word_imm(ps, "recurse", src);
 
     src.count=0;
     {
@@ -854,7 +862,7 @@ void populate_core_words(Program_State *ps)
         sb_free(param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "type", src);
+    add_word_effect(ps, "type", src, 2, 0);
 
     sb_free(src);
 }
@@ -881,7 +889,7 @@ void populate_tool_words(Program_State *ps)
             sb_insert_C_call(&src, exit, &param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, "bye", src);
+    add_word(ps, "bye", src);
 
     src.count = 0;
     {
@@ -890,7 +898,7 @@ void populate_tool_words(Program_State *ps)
             sb_insert_C_call(&src, dot_s_impl, &param_code);
         sb_insert_ret(&src);
     }
-    add_word(&ps->word_table, ".s", src);
+    add_word(ps, ".s", src);
 
     sb_free(src);
 }

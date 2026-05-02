@@ -1,6 +1,7 @@
 #include <interpreter.h>
 #include <codegen.h>
 #include <errno.h>
+#include <stdint.h>
 
 static void smorth_die(const char *message)
 {
@@ -25,6 +26,77 @@ static void *xmalloc(size_t size)
     return ptr;
 }
 
+static int64_t *smorth_stack_base(Program_State *ps)
+{
+    return ps->stack_base ? ps->stack_base : ps->stack;
+}
+
+static int64_t *smorth_stack_limit(Program_State *ps)
+{
+    return ps->stack_limit ? ps->stack_limit : ps->stack + SMORTH_STACK_CAPACITY;
+}
+
+static int64_t smorth_stack_depth_checked(Program_State *ps, const char *word)
+{
+    int64_t *base = smorth_stack_base(ps);
+    int64_t *limit = smorth_stack_limit(ps);
+    if(ps->sp<base)
+    {
+        fprintf(stderr, "stack underflow in %s\n", word);
+        exit(1);
+    }
+    if(ps->sp>limit)
+    {
+        fprintf(stderr, "stack overflow in %s\n", word);
+        exit(1);
+    }
+    return ps->sp - base;
+}
+
+void smorth_stack_effect_guard(Program_State *ps, const char *word, int64_t pop_count, int64_t push_count)
+{
+    if(ps==NULL) smorth_die("missing program state for stack check");
+    if(word==NULL) word = "<unknown>";
+    if(pop_count<0 || push_count<0) smorth_die("invalid stack effect");
+
+    int64_t depth = smorth_stack_depth_checked(ps, word);
+    if(depth<pop_count)
+    {
+        fprintf(stderr, "stack underflow in %s\n", word);
+        exit(1);
+    }
+    if(depth-pop_count+push_count > smorth_stack_limit(ps)-smorth_stack_base(ps))
+    {
+        fprintf(stderr, "stack overflow in %s\n", word);
+        exit(1);
+    }
+}
+
+int64_t smorth_stack_pop(Program_State *ps, const char *word)
+{
+    smorth_stack_effect_guard(ps, word, 1, 0);
+    return *(--ps->sp);
+}
+
+void smorth_stack_push(Program_State *ps, int64_t value, const char *word)
+{
+    smorth_stack_effect_guard(ps, word, 0, 1);
+    *(ps->sp++) = value;
+}
+
+void sb_insert_stack_effect_guard(String_Builder *sb, Program_State *ps, const char *word, int64_t pop_count, int64_t push_count)
+{
+    if(pop_count==0 && push_count==0) return;
+
+    String_Builder param_code = {0};
+    sb_insert_movabs(&param_code, get_register(1), ps);
+    sb_insert_movabs(&param_code, get_register(2), (void *)word);
+    sb_insert_movabs(&param_code, get_register(3), (void *)(intptr_t)pop_count);
+    sb_insert_movabs(&param_code, get_register(4), (void *)(intptr_t)push_count);
+    sb_insert_C_call(sb, smorth_stack_effect_guard, &param_code);
+    sb_free(param_code);
+}
+
 void interpret(Program_State *program_state)
 {
     while (strcmp(program_state->ib.data, "")!=0&&program_state->ib.count!=0)
@@ -37,6 +109,7 @@ void interpret(Program_State *program_state)
             {
                 if (program_state->word_name==NULL) smorth_die("invalid word declaration");
 
+                sb_insert_stack_effect_guard(&program_state->word_source, program_state, "number literal", 0, 1);
                 sb_insert_mov(&program_state->word_source, reg_make_ptr(get_register(1),0), get_register(0));
                 sb_insert_movabs(&program_state->word_source, get_register(5), (void *)token.as.number);
                 sb_insert_mov(&program_state->word_source, get_register(5), reg_make_ptr(get_register(0),0));
@@ -44,8 +117,7 @@ void interpret(Program_State *program_state)
             }
             else
             {
-                *program_state->sp=token.as.number;
-                program_state->sp++;
+                smorth_stack_push(program_state, token.as.number, "number literal");
                 program_state->current_word=token.raw.data;
             }
         }
@@ -58,7 +130,11 @@ void interpret(Program_State *program_state)
                 {
                     Execution_Token *word = get_word(&program_state->word_table, token.as.word.data);
                     if(word==NULL) smorth_die_undefined_word(token.as.word.data);
-                    if(word->imm) call_word(word->codeptr, program_state);
+                    if(word->imm)
+                    {
+                        program_state->current_word=word->name;
+                        call_word(word->codeptr, program_state);
+                    }
                     else sb_insert_call(&program_state->word_source, word->codeptr);
                 }
             }
@@ -75,7 +151,7 @@ void interpret(Program_State *program_state)
                     if(word==NULL) smorth_die_undefined_word(token.as.word.data);
                     program_state->current_word=word->name;
                     call_word(word->codeptr, program_state);
-                    if (program_state->sp<program_state->stack) smorth_die("stack underflow");
+                    smorth_stack_effect_guard(program_state, word->name, 0, 0);
                     {
                         String_Builder word_ret = {0};
                         sb_append_cstr(&word_ret, word->name);
@@ -143,10 +219,12 @@ Token next_token(String_View *source)
 void *exallocsb(String_Builder *sb);
 void exfreesb(void *ptr, size_t len);
 
-void add_word_impl(Word_Table *word_table, const char *name, String_Builder source, bool immediate)
+void add_word_impl(Program_State *ps, const char *name, String_Builder source, bool immediate, int64_t pop_count, int64_t push_count)
 {
+    if(ps==NULL) smorth_die("missing program state for word definition");
     String_Builder tmp = {0};
     sb_insert_word_prologue(&tmp);
+    sb_insert_stack_effect_guard(&tmp, ps, name ? name : "<anonymous>", pop_count, push_count);
     sb_append_buf(&tmp, source.items, source.count);
     source = tmp;
     
@@ -160,10 +238,12 @@ void add_word_impl(Word_Table *word_table, const char *name, String_Builder sour
         } else word->name=NULL;
         word->source = source;
         word->codeptr = exallocsb(&source);
-    da_append(word_table, word);
+    da_append(&ps->word_table, word);
 }
-void add_word(Word_Table *word_table, const char *name, String_Builder source) { add_word_impl(word_table, name, source, false); }
-void add_word_imm(Word_Table *word_table, const char *name, String_Builder source) { add_word_impl(word_table, name, source, true); }
+void add_word(Program_State *ps, const char *name, String_Builder source) { add_word_impl(ps, name, source, false, 0, 0); }
+void add_word_imm(Program_State *ps, const char *name, String_Builder source) { add_word_impl(ps, name, source, true, 0, 0); }
+void add_word_effect(Program_State *ps, const char *name, String_Builder source, int64_t pop_count, int64_t push_count) { add_word_impl(ps, name, source, false, pop_count, push_count); }
+void add_word_imm_effect(Program_State *ps, const char *name, String_Builder source, int64_t pop_count, int64_t push_count) { add_word_impl(ps, name, source, true, pop_count, push_count); }
 
 Execution_Token *get_word(Word_Table *word_table, const char *name)
 {
@@ -176,6 +256,7 @@ void call_word(void(*word)(int64_t**), Program_State *program_state)
 {
     if(word==NULL) smorth_die("cannot call null word");
     word(&program_state->sp);
+    smorth_stack_effect_guard(program_state, program_state->current_word, 0, 0);
 }
 
 

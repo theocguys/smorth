@@ -74,6 +74,28 @@ run_fails_contains() {
     esac
 }
 
+run_limited_stack_fails_contains() {
+    name=$1
+    limit=$2
+    input=$3
+    expected=$4
+
+    set +e
+    raw_output=$(printf '%b' "$input" | SMORTH_STACK_LIMIT_CELLS=$limit ./smorth 2>&1)
+    status=$?
+    set -e
+    output=$(printf '%s' "$raw_output" | tr '\n' ' ')
+
+    if [ "$status" -eq 0 ]; then
+        fail "$name" "expected nonzero exit" "actual output: $output"
+    fi
+
+    case "$output" in
+        *"$expected"*) pass "$name" ;;
+        *) fail "$name" "expected substring: $expected" "actual output: $output" ;;
+    esac
+}
+
 build
 
 run_contains "arithmetic" \
@@ -128,9 +150,22 @@ run_fails_contains "compile-time undefined word error" \
     ': broken not-a-word ;\n' \
     'undefined word: not-a-word'
 
+run_fails_contains "generated stack underflow error" \
+    'drop\n' \
+    'stack underflow in drop'
+
+run_fails_contains "compiled generated stack underflow error" \
+    ': bad + ; bad\n' \
+    'stack underflow in +'
+
 run_fails_contains "integer overflow error" \
     '999999999999999999999999999999999999999999\n' \
     'invalid number:'
+
+run_limited_stack_fails_contains "interpreted stack overflow error" \
+    8 \
+    '1 1 1 1 1 1 1 1 1\n' \
+    'stack overflow in number literal'
 
 run_fails_contains "semicolon outside definition error" \
     ';\n' \
