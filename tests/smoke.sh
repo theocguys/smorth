@@ -122,6 +122,18 @@ run_contains "compiled string output" \
 
 run_fails_contains "undefined word error" \
     'not-a-word\n' \
-    'word ( not-a-word ) not defined'
+    'undefined word: not-a-word'
+
+run_fails_contains "compile-time undefined word error" \
+    ': broken not-a-word ;\n' \
+    'undefined word: not-a-word'
+
+run_fails_contains "integer overflow error" \
+    '999999999999999999999999999999999999999999\n' \
+    'invalid number:'
+
+run_fails_contains "semicolon outside definition error" \
+    ';\n' \
+    '; outside word declaration'
 
 printf 'All smoke tests passed.\n'

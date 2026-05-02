@@ -1,5 +1,29 @@
 #include <interpreter.h>
 #include <codegen.h>
+#include <errno.h>
+
+static void smorth_die(const char *message)
+{
+    fprintf(stderr, "%s\n", message);
+    exit(1);
+}
+
+static void smorth_die_undefined_word(const char *name)
+{
+    fprintf(stderr, "undefined word: %s\n", name);
+    exit(1);
+}
+
+static void *xmalloc(size_t size)
+{
+    void *ptr = malloc(size);
+    if(ptr==NULL)
+    {
+        fprintf(stderr, "out of memory allocating %zu bytes\n", size);
+        exit(1);
+    }
+    return ptr;
+}
 
 void interpret(Program_State *program_state)
 {
@@ -11,7 +35,7 @@ void interpret(Program_State *program_state)
         {
             if (program_state->compiling)
             {
-                if (program_state->word_name==NULL) {printf("invalid word declaration"); exit(1);}
+                if (program_state->word_name==NULL) smorth_die("invalid word declaration");
 
                 sb_insert_mov(&program_state->word_source, reg_make_ptr(get_register(1),0), get_register(0));
                 sb_insert_movabs(&program_state->word_source, get_register(5), (void *)token.as.number);
@@ -33,20 +57,25 @@ void interpret(Program_State *program_state)
                 else
                 {
                     Execution_Token *word = get_word(&program_state->word_table, token.as.word.data);
+                    if(word==NULL) smorth_die_undefined_word(token.as.word.data);
                     if(word->imm) call_word(word->codeptr, program_state);
                     else sb_insert_call(&program_state->word_source, word->codeptr);
                 }
             }
             else
             {
-                if (strcmp(token.as.word.data, "immediate")==0) program_state->word_table.items[program_state->word_table.count-1]->imm=true;
+                if (strcmp(token.as.word.data, "immediate")==0)
+                {
+                    if(program_state->word_table.count==0) smorth_die("immediate requires a previous word");
+                    program_state->word_table.items[program_state->word_table.count-1]->imm=true;
+                }
                 else
                 {
                     Execution_Token *word = get_word(&program_state->word_table, token.as.word.data);
-                    if(word==NULL) {printf("word ( %s ) not defined", token.as.word.data); exit(1);}
+                    if(word==NULL) smorth_die_undefined_word(token.as.word.data);
                     program_state->current_word=word->name;
                     call_word(word->codeptr, program_state);
-                    if (program_state->sp<program_state->stack) {printf("stack underflow"); exit(1);}
+                    if (program_state->sp<program_state->stack) smorth_die("stack underflow");
                     {
                         String_Builder word_ret = {0};
                         sb_append_cstr(&word_ret, word->name);
@@ -62,15 +91,29 @@ void interpret(Program_State *program_state)
 }
 
 
-bool str_isnumber(const char *raw)
+typedef enum
+{
+    NUMBER_PARSE_NOT_NUMBER,
+    NUMBER_PARSE_OK,
+    NUMBER_PARSE_INVALID
+}
+Number_Parse_Result;
+
+static Number_Parse_Result parse_i64(const char *raw, int64_t *out)
 {
     size_t i = 0;
     if (raw[i]=='-' || raw[i]=='+') i++;
-    while (i<strlen(raw) && isdigit(raw[i])) i++;
-    if (raw[i]=='.') while (i<strlen(raw) && isdigit(raw[i])) i++;
-    while (i<strlen(raw) && isspace(raw[i])) i++;
-    if (i!=strlen(raw) || !isdigit(raw[i-1]) || i==0) return false;
-    return true;
+    if (!isdigit((unsigned char)raw[i])) return NUMBER_PARSE_NOT_NUMBER;
+    while (isdigit((unsigned char)raw[i])) i++;
+    while (isspace((unsigned char)raw[i])) i++;
+    if(raw[i]!='\0') return NUMBER_PARSE_NOT_NUMBER;
+
+    errno = 0;
+    char *end = NULL;
+    long long number = strtoll(raw, &end, 10);
+    if(errno==ERANGE || end==raw) return NUMBER_PARSE_INVALID;
+    *out = (int64_t)number;
+    return NUMBER_PARSE_OK;
 }
 
 Token next_token(String_View *source)
@@ -80,13 +123,18 @@ Token next_token(String_View *source)
 
     String_Builder rawsb = {0};
     while (source->count>0 && !isspace(source->data[0])) sb_append(&rawsb, *sv_chop_left(source, 1).data);
-    if (source->count>0) sb_append_null(&rawsb);
+    sb_append_null(&rawsb);
     String_View raw = sb_to_sv(rawsb);
-    if (str_isnumber(raw.data))
+    int64_t number = 0;
+    Number_Parse_Result number_parse = parse_i64(raw.data, &number);
+    if (number_parse==NUMBER_PARSE_OK)
     {
-        int64_t number = atoll(raw.data);
-        if ((strcmp(raw.data, "0") && strcmp(raw.data, "-0") && strcmp(raw.data, "+0")) && number==0) exit(1);
         return (Token){.kind=NUMBER, .raw=raw, .as.number=number};
+    }
+    if(number_parse==NUMBER_PARSE_INVALID)
+    {
+        fprintf(stderr, "invalid number: %s\n", raw.data);
+        exit(1);
     }
     else return (Token){.kind=FWORD, .raw=raw, .as.word=raw};
 }
@@ -102,12 +150,13 @@ void add_word_impl(Word_Table *word_table, const char *name, String_Builder sour
     sb_append_buf(&tmp, source.items, source.count);
     source = tmp;
     
-    Execution_Token *word = malloc(sizeof(Execution_Token));
-       word->imm=immediate;
+    Execution_Token *word = xmalloc(sizeof(Execution_Token));
+        word->imm=immediate;
         if(name)
         {
-            word->name = malloc(strlen(name));
-            memcpy(word->name, name, strlen(name)+1);
+            size_t name_len = strlen(name);
+            word->name = xmalloc(name_len+1);
+            memcpy(word->name, name, name_len+1);
         } else word->name=NULL;
         word->source = source;
         word->codeptr = exallocsb(&source);
@@ -125,6 +174,7 @@ Execution_Token *get_word(Word_Table *word_table, const char *name)
 
 void call_word(void(*word)(int64_t**), Program_State *program_state)
 {
+    if(word==NULL) smorth_die("cannot call null word");
     word(&program_state->sp);
 }
 
@@ -138,14 +188,27 @@ void call_word(void(*word)(int64_t**), Program_State *program_state)
 void *exallocsb(String_Builder *sb)
 {
 #ifdef _WIN32
+    if(sb->count==0) smorth_die("cannot allocate empty executable buffer");
     void *ptr = VirtualAlloc(NULL, sb->count, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if(ptr==NULL) smorth_die("VirtualAlloc executable buffer failed");
     memcpy(ptr, sb->items, sb->count);
     return ptr;
 #else
+    if(sb->count==0) smorth_die("cannot allocate empty executable buffer");
     void *ptr = mmap(NULL, sb->count, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(ptr==MAP_FAILED)
+    {
+        perror("mmap executable buffer");
+        exit(1);
+    }
     memcpy(ptr, sb->items, sb->count);
     __builtin___clear_cache(ptr, (char *)ptr + sb->count);
-    mprotect(ptr, sb->count, PROT_READ | PROT_EXEC);
+    if(mprotect(ptr, sb->count, PROT_READ | PROT_EXEC)!=0)
+    {
+        perror("mprotect executable buffer");
+        munmap(ptr, sb->count);
+        exit(1);
+    }
     return ptr;
 #endif
 }
